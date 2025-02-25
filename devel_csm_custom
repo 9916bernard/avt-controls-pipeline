@@ -1,0 +1,433 @@
+
+#!/usr/bin/env python3
+
+import os
+import time
+import math
+import rclpy
+from rclpy.node import Node
+import numpy as np
+from numpy import linalg as la
+from car_ros_msgs.msg import Trajectory, Waypoint, TurnSignal, VehicleCommand
+# import matplotlib.pyplot as plt
+import pymap3d as pm
+from controls.Cubic_Spline import *
+from controls import ccma
+from std_msgs.msg import Float64MultiArray, Bool, Float64
+# from novatel_gps_msgs.msg import NovatelDualAntennaHeading
+# import matplotlib.pyplot as plt
+
+class StateMachine(Node):
+    def __init__(self):
+        super().__init__('state_machine')
+
+        self.freqs = 10
+
+        # # Initialize real-time plotting variables
+        # self.fig, self.ax = plt.subplots()
+        # self.trajectory_plot, = self.ax.plot([], [], 'go-', label='Trajectory Points')
+        # self.enu_plot, = self.ax.plot([], [], 'ro-', label='ENU Waypoints')
+        # self.ax.set_xlabel('Northings')
+        # self.ax.set_ylabel('Eastings')
+        # self.ax.set_title('ENU Trajectory')
+        # self.ax.grid(True)
+        # self.ax.legend()
+
+        # Interpolation Variables
+        w_ma = 6
+        w_cc = 2
+        self.ccma = ccma.CCMA(w_ma, w_cc, distrib="hanning")
+
+        # Retrieve parameters from ROS parameter server
+        self.ref_lat = self.declare_parameter("/enu_ref_lat_float", 40.86264953378).value
+        self.ref_lon = self.declare_parameter("/enu_ref_lon_float", -77.83515962585).value
+        self.ref_height = self.declare_parameter("/enu_ref_height_float", 360).value
+        self.vel = self.declare_parameter("/path_velocity_value_float", 2.0).value
+        self.translation_east = self.declare_parameter("/translation_east_float", 60).value
+        self.translation_north = self.declare_parameter("/translation_north_float", -20).value
+
+        # Path variables
+        self.waypoints = []
+        self.stop_position = []
+        self.translation_east_calc = 0.0
+        self.translation_north_calc = 0.0
+
+        # State Conditions
+        self.new_message_received = False
+        self.new_speed_received = False
+        self.stop_position_updated = False
+        self.emergency_stop = False
+        self.lane_change_received = False
+
+        # Define Variables as Messages
+        self.traj = Trajectory()
+        self.lane = Float64MultiArray()
+        self.turn = TurnSignal()
+
+        # ROS2 subscriptions and publishers
+        self.create_subscription(Float64MultiArray, "WaypointDecide_decision_topic", self.stop_decision_callback, 10)
+        self.create_subscription(Bool, "Emergency_stop_topic", self.emergency_stop_callback, 10)
+        self.create_subscription(Float64, "Speed_topic", self.velocity_callback, 10)
+        self.create_subscription(Float64MultiArray, "Lane_change_topic", self.lane_change_callback, 10)
+        self.create_subscription(Trajectory, "global_planner", self.path_planning_callback, 10)
+        # self.create_subscription(NovatelDualAntennaHeading, "dual_antenna_heading", self.heading_callback, 10)
+
+        self.traj_pub = self.create_publisher(Trajectory, 'Trajectory_topic', 10)
+        self.lane_pub = self.create_publisher(Float64MultiArray, 'LLA_lane_change_topic', 10)
+        self.turn_pub = self.create_publisher(TurnSignal, 'turn_signal_topic', 10)
+        self.path_pub = self.create_publisher(Trajectory, 'enu_path_topic', 10)
+
+        # ROS2 timer (replaces rospy.Rate in ROS1)
+        self.timer = self.create_timer(1.0 / self.freqs, self.decision_handler)
+
+    """
+    Callback functions for ROS subscribers
+    """
+    def path_planning_callback(self, data):
+        longitudes = []
+        latitudes = []
+        velocities = []
+
+        for point in data.trajectory:
+            longitudes.append(point.longitude)
+            latitudes.append(point.latitude)
+            velocities.append(point.velocity)
+
+        self.waypoints = [list(item) for item in zip(latitudes, longitudes, velocities)]
+        self.new_message_received = True
+
+    '''
+    def heading_callback(self, data):
+        self.vehicle_headingc = data.heading  # This heading is in degrees east of north
+        self.translation_east_calc = math.cos(math.radians(self.vehicle_headingc))  # Translate meters to the right
+        self.translation_north_calc = -math.sin(math.radians(self.vehicle_headingc))
+    '''
+
+    def velocity_callback(self, data):
+        new_vel = data.data
+        self.vel = new_vel
+        self.new_speed_received = True
+
+    def stop_decision_callback(self, data):
+        x, y = data.data
+        self.stop_position = [x, y]
+        self.stop_position_updated = True
+
+    def emergency_stop_callback(self, data):
+        self.emergency_stop = data.data
+        if self.emergency_stop:
+            self.get_logger().info("EMERGENCY STOP: STATE MACHINE IS LOCKED")
+        else:
+            self.get_logger().info("STATE MACHINE IS UNLOCKED")
+
+    def lane_change_callback(self, data):
+        x = data.data[0]
+        y = data.data[1]
+        self.lane_change = [x, y]
+        self.lane_change_received = True
+        self.get_logger().info(f"Lane is blocked: (x={x}, y={y})")
+
+    def lla2enu_converter(self, waypoints, height, ref_lat, ref_lon, ref_height):
+        # Convert the first waypoint to ENU coordinates
+        self.first_enu = pm.geodetic2enu(waypoints[0][0], waypoints[0][1], height, ref_lat, ref_lon, ref_height)
+
+        # Calculate the offset from the reference point
+        offset_east = self.first_enu[0]
+        offset_north = self.first_enu[1]
+
+        # Apply the offset to all waypoints
+        adjusted_waypoints = []
+        for lat, lon in waypoints:
+            enu = pm.geodetic2enu(lat, lon, height, ref_lat, ref_lon, ref_height)
+            adjusted_east = enu[0] - offset_east + self.translation_east
+            adjusted_north = enu[1] - offset_north + self.translation_north
+            adjusted_waypoints.append((adjusted_east, adjusted_north))
+
+        return adjusted_waypoints
+
+    def lla2enu(self, waypoints):
+        adjusted_waypoints = self.lla2enu_converter(waypoints, self.ref_height, self.ref_lat, self.ref_lon, self.ref_height)
+        return adjusted_waypoints
+
+    def mcity_lla2enu(self, waypoints):
+        """
+        Convert LLA waypoints to ENU waypoints using MCity reference coordinates.
+        """
+        adjusted_waypoints = []
+
+        for lat, lon in waypoints:
+            # Convert LLA to ENU
+            enu = pm.geodetic2enu(lat, lon, self.ref_height, self.ref_lat, self.ref_lon, self.ref_height)
+            # Adjust the ENU coordinates
+            adjusted_east = enu[0] + self.translation_east
+            adjusted_north = enu[1] + self.translation_north
+
+            # Append adjusted coordinates to the list
+            adjusted_waypoints.append((adjusted_east, adjusted_north))
+
+        return adjusted_waypoints
+
+    def interpolate_points(self, route):
+        x = []  # empty set of lat coords
+        y = []  # empty set of long coords
+        for i in range(len(route)):
+            x += [route[i][0]]
+            y += [route[i][1]]
+        # interpolate the points
+        [rx, ry] = main_2d(x, y)
+        interpolated_points = []
+        for i in range(len(rx)):
+            interpolated_points.append((rx[i], ry[i]))
+        return interpolated_points
+
+    def ccma_filter(self, interpolated_points, ccma_object):
+        # Filter points with and w/o boundaries
+        ccma_points = ccma_object.filter(np.array(interpolated_points))
+
+        # Assuming ccma_points is a NumPy array
+        ccma_points_list = ccma_points.tolist()
+
+        # Convert ccma_list to a list of tuples
+        ccma_points_list = [tuple(point) for point in ccma_points]
+
+        return ccma_points_list
+
+    def interpolate_waypoints(self, route):
+        interpolated_points = self.interpolate_points(route)
+        filtered_points = self.ccma_filter(interpolated_points, self.ccma)
+
+        return filtered_points
+
+    def publish_enu_path(self):
+        """
+        This function publishes the entire global path at once, and updates the real-time plot.
+        """
+        lla_waypoints = self.waypoints
+        interpolated_lla_waypoints = self.interpolate_waypoints(lla_waypoints)
+
+        # print('Interpolated Points: ', interpolated_lla_waypoints)
+
+        enu_waypoints = self.lla2enu(interpolated_lla_waypoints)
+
+        # Clear the trajectory message before adding new points
+        self.traj.trajectory = []
+
+        traj_eastings = []
+        traj_northings = []
+
+        for east, north in enu_waypoints:
+            points = Waypoint()
+            points.east = east
+            points.north = north
+            points.velocity = float(self.vel)  # Explicitly cast velocity to float
+            self.traj.trajectory.append(points)
+
+            traj_eastings.append(east)
+            traj_northings.append(north)
+
+        # Publish the trajectory
+        self.traj_pub.publish(self.traj)
+        self.get_logger().info("Published ENU path with updated velocities.")
+
+        # # Update the plot in real-time
+        # self.update_plot(traj_eastings, traj_northings)
+
+    # def update_plot(self, eastings, northings):
+    #     """
+    #     Update the real-time plot with new trajectory points.
+    #     """
+    #     # Update trajectory plot data
+    #     self.trajectory_plot.set_data(northings, eastings)
+
+    #     # Adjust plot limits dynamically
+    #     self.ax.set_xlim(min(northings) - 10, max(northings) + 10)
+    #     self.ax.set_ylim(min(eastings) - 10, max(eastings) + 10)
+
+    #     # Redraw the plot
+    #     plt.pause(0.001)  # Allow non-blocking updates to the plot
+
+    def publish_velocity(self):
+        for waypoint in self.traj.trajectory:
+            waypoint.velocity = float(self.vel)
+        self.traj_pub.publish(self.traj)
+        self.get_logger().info(f"Published updated trajectory with new velocity: {self.vel}")
+
+    def stop_decider(self, waypoints, decider, t, est, stop_position):
+        '''
+        Stop_at_Point Function, Determines a Stopping Point from a Distance with realistic deceleration.
+        If the exact stop position is not found in the waypoints, find the nearest waypoint and use that as the stop point.
+        '''
+
+        est = 1
+        waypoints_list = waypoints
+        decider_index = None
+        decider = stop_position
+
+        # Initialize minimum distance variables
+        min_distance = float('inf')
+        min_index = None
+
+        # Find the waypoint closest to the stop position within estimation error
+        for i, waypoint in enumerate(waypoints_list):
+            lat, lon, vel = waypoint
+            distance = math.hypot(lat - decider[0], lon - decider[1])
+            if distance < est:
+                decider_index = i
+                self.get_logger().info(f"Found waypoint within estimation error at index {decider_index}")
+                break  # Found a waypoint within estimation error
+            if distance < min_distance:
+                min_distance = distance
+                min_index = i
+
+        if decider_index is None:
+            # If no waypoint is within estimation error, use the nearest waypoint
+            decider_index = min_index
+            self.get_logger().info(f"No waypoint within estimation error; using nearest waypoint at index {decider_index} with distance {min_distance:.2f}")
+
+        # Start deceleration a few points before the stop position
+        start_deceleration_index = max(0, decider_index - t)  # Start deceleration t waypoints before stop
+        initial_velocity = waypoints_list[start_deceleration_index][2]
+
+        # Calculate a realistic deceleration step using the safe rate (e.g., 3 m/s²)
+        distance_to_stop = decider_index - start_deceleration_index
+        if distance_to_stop > 0:
+            deceleration_rate = initial_velocity / distance_to_stop  # Velocity step based on the distance
+
+            for i in range(start_deceleration_index, decider_index):
+                # Gradually reduce velocity, ensuring it stays positive
+                new_velocity = max(waypoints_list[i][2] - deceleration_rate, 0)
+                waypoints_list[i] = (waypoints_list[i][0], waypoints_list[i][1], new_velocity)
+                # self.get_logger().info(f"Waypoint {i}: Setting velocity to {new_velocity:.2f}")
+
+        # Set the velocity to 0 for all waypoints after the stop point
+        for i in range(decider_index, len(waypoints_list)):
+            waypoints_list[i] = (waypoints_list[i][0], waypoints_list[i][1], 0)
+            # self.get_logger().info(f"Waypoint {i}: Setting velocity to 0 (stop)")
+
+        return waypoints_list  # Return the updated list of waypoints
+
+    def publish_stop_at_point(self):
+        # Retrieve existing waypoints from self.traj
+        existing_waypoints = [(wp.east, wp.north, wp.velocity) for wp in self.traj.trajectory]
+
+        # Call the stop_decider method with the existing waypoints
+        if self.stop_position_updated:
+            updated_waypoints = self.stop_decider(existing_waypoints, decider=None, t=3, est=1, stop_position=self.stop_position)
+            self.stop_position_updated = False
+
+            self.traj.trajectory = []
+
+            # Update self.traj with the modified waypoints
+            for east, north, velocity in updated_waypoints:
+                waypoint = Waypoint()
+                waypoint.east = east
+                waypoint.north = north
+                waypoint.velocity = float(velocity)
+                self.traj.trajectory.append(waypoint)
+
+            # Publish the updated trajectory
+            self.traj_pub.publish(self.traj)
+            self.get_logger().info("Published updated trajectory with stop at point")
+
+            # Set self.vel to 0
+            self.vel = 0
+
+    def publish_emergency_stop(self):
+        # Set velocity to 0 for all waypoints in self.traj
+        for waypoint in self.traj.trajectory:
+            waypoint.velocity = 0
+
+        # Publish the updated trajectory
+        self.traj_pub.publish(self.traj)
+        self.get_logger().info("Stopping Car, Locking State Machine")
+
+    def publish_lane_change(self):
+        # Calculate the offset from the reference point
+        offset_east = self.first_enu[0]
+        offset_north = self.first_enu[1]
+
+        adjusted_lane_change_east = self.lane_change[0] + offset_east - self.translation_east
+        adjusted_lane_change_north = self.lane_change[1] + offset_north - self.translation_north
+        adjusted_lane_change_height = self.first_enu[2]
+
+        # Convert lane change ENU coordinates to geodetic coordinates (LLA)
+        adjusted_lane_change_east = self.lane_change[0] + self.translation_east
+        adjusted_lane_change_north = self.lane_change[1] + self.translation_north
+        adjusted_lane_change_height = self.ref_height  # Assuming height remains constant
+
+        lat, lon, alt = pm.enu2geodetic(
+            adjusted_lane_change_east,
+            adjusted_lane_change_north,
+            adjusted_lane_change_height,
+            self.ref_lat,
+            self.ref_lon,
+            self.ref_height
+        )
+
+        # Populate the lane change message
+        self.lane.data = [lat, lon]
+
+        # Publish the lane change message
+        self.lane_pub.publish(self.lane)
+
+        self.get_logger().info(f"Published lane change coordinates: Latitude = {lat}, Longitude = {lon}")
+
+        # # --- PLOT IN ENU ---
+        # # Clear the trajectory and lane change points (without clearing the legend)
+        # self.ax.cla()
+        # self.ax.grid(True)
+        # self.ax.set_xlabel('Northings')
+        # self.ax.set_ylabel('Eastings')
+        # self.ax.set_title('ENU Trajectory')
+
+        # # Re-plot trajectory points
+        # traj_eastings = [point.east for point in self.traj.trajectory]
+        # traj_northings = [point.north for point in self.traj.trajectory]
+        # self.ax.plot(traj_northings, traj_eastings, 'go-', label='Trajectory Points')
+
+        # # Plot the latest lane change point
+        # self.ax.plot(adjusted_lane_change_north, adjusted_lane_change_east, 'bo-', label='Lane Change Point')
+
+        # # Only show the legend once to avoid stacking
+        # self.ax.legend(loc='upper left')
+
+        # # Redraw the plot with updated data
+        # plt.pause(0.001)  # Allow for real-time updates
+        # self.get_logger().info(f"Plotted lane change at ENU (East: {adjusted_lane_change_east}, North: {adjusted_lane_change_north})")
+
+    def decision_handler(self):
+        """
+        Use all of the other functions to run a state machine.
+        """
+        if self.emergency_stop:
+            self.publish_emergency_stop()
+        else:
+            if self.new_message_received:
+                print('Entering Path Planning State')
+                self.publish_enu_path()
+                self.new_message_received = False
+            elif self.new_speed_received:
+                self.publish_velocity()
+                self.new_speed_received = False
+            elif self.stop_position_updated:
+                self.publish_stop_at_point()
+                self.stop_position_updated = False
+            elif self.lane_change_received:
+                self.publish_lane_change()
+                self.lane_change_received = False
+
+# Main ROS2 spin function
+def main(args=None):
+    rclpy.init(args=args)
+    planner = StateMachine()
+
+    try:
+        rclpy.spin(planner)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        planner.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
